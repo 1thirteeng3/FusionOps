@@ -1,0 +1,33 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: locapredict-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      # Local validation only. Never commit real secrets: production secret
+      # comes from the PaaS dashboard (ENV=production refuses to boot without
+      # JWT_SECRET). Override locally via `JWT_SECRET=... docker compose up`.
+      - JWT_SECRET=${JWT_SECRET:-dev-compose-secret-NOT-FOR-PROD}
+      - ENV=${ENV:-development}
+    volumes:
+      - ./data:/app/data
+    # NOTE: locapredict.db is intentionally NOT mounted. On fresh clones the
+    # host file does not exist and Docker would create a directory in its
+    # place, crashing SQLite. Ephemeral in-container DB matches the
+    # validation-deploy contract (seed rebuilds from parquet at boot).
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: locapredict-frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+    restart: unless-stopped

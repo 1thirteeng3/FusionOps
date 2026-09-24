@@ -1,0 +1,19 @@
+# FusionOps — LocaPredict SLA Guard v3 (validation deploy)
+# Secrets never committed: Render dashboard holds JWT_SECRET + role passwords.
+.env
+.env.local
+*.db
+*.sqlite3
+*.zip
+node_modules/
+**/node_modules/
+**/frontend/dist/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+**/.pytest_cache/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
