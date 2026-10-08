@@ -69,6 +69,48 @@ def init_db():
         )
         """)
 
+        # Fase 6.2 — auditoria contínua de saída (prediction_audit).
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS prediction_audit (
+            ticket_id TEXT PRIMARY KEY,
+            predicted_risk REAL,
+            predicted_time REAL,
+            actual_sla_violated INTEGER,
+            actual_resolution_time REAL,
+            timestamp_prediction TEXT,
+            timestamp_resolution TEXT
+        )
+        """)
+        # Migração: releases iniciais criaram predicted_* NOT NULL; desfechos
+        # sem previsão prévia exigem NULL. Reconstrói preservando linhas.
+        cols = {r[1]: r[3] for r in cursor.execute("PRAGMA table_info(prediction_audit)").fetchall()}
+        if cols.get("predicted_risk") == 1:
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS prediction_audit_new (
+                ticket_id TEXT PRIMARY KEY,
+                predicted_risk REAL,
+                predicted_time REAL,
+                actual_sla_violated INTEGER,
+                actual_resolution_time REAL,
+                timestamp_prediction TEXT,
+                timestamp_resolution TEXT
+            )
+            """)
+            cursor.execute("""
+            INSERT OR IGNORE INTO prediction_audit_new
+            SELECT ticket_id, predicted_risk, predicted_time,
+                   actual_sla_violated, actual_resolution_time,
+                   timestamp_prediction, timestamp_resolution
+            FROM prediction_audit
+            """)
+            cursor.execute("DROP TABLE prediction_audit")
+            cursor.execute("ALTER TABLE prediction_audit_new RENAME TO prediction_audit")
+            logger.info("Migrated prediction_audit to nullable prediction columns.")
+        cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_audit_resolution_time
+        ON prediction_audit (timestamp_resolution)
+        """)
+
         # Audit hardening (Constitution VII, Gate 6, T007): indexes for
         # append-only trail queries; tables are never updated in place.
         cursor.execute("""
@@ -196,6 +238,81 @@ class DatabaseRepository:
             conn.commit()
             conn.close()
             return n
+
+    @staticmethod
+    def record_prediction(ticket_id: str, predicted_risk: float, predicted_time: float) -> None:
+        """Grava previsão no momento da abertura (Fase 6.2)."""
+        with _db_lock:
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+            INSERT OR REPLACE INTO prediction_audit
+                (ticket_id, predicted_risk, predicted_time,
+                 actual_sla_violated, actual_resolution_time,
+                 timestamp_prediction, timestamp_resolution)
+            VALUES (?, ?, ?, COALESCE((SELECT actual_sla_violated FROM prediction_audit WHERE ticket_id = ?), NULL),
+                   COALESCE((SELECT actual_resolution_time FROM prediction_audit WHERE ticket_id = ?), NULL),
+                   ?, NULL)
+            """, (ticket_id, float(predicted_risk), float(predicted_time),
+                  ticket_id, ticket_id, datetime.now().isoformat()))
+            conn.commit()
+            conn.close()
+
+    @staticmethod
+    def record_resolution(ticket_id: str, actual_sla_violated: bool,
+                          actual_resolution_time: float) -> bool:
+        """Grava o desfecho real no encerramento (Fase 6.2). Retorna se existia previsão."""
+        with _db_lock:
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT ticket_id FROM prediction_audit WHERE ticket_id = ?", (ticket_id,))
+            exists = cursor.fetchone() is not None
+            if exists:
+                cursor.execute("""
+                UPDATE prediction_audit
+                SET actual_sla_violated = ?, actual_resolution_time = ?, timestamp_resolution = ?
+                WHERE ticket_id = ?
+                """, (1 if actual_sla_violated else 0, float(actual_resolution_time),
+                      datetime.now().isoformat(), ticket_id))
+            else:
+                cursor.execute("""
+                INSERT INTO prediction_audit
+                    (ticket_id, predicted_risk, predicted_time,
+                     actual_sla_violated, actual_resolution_time,
+                     timestamp_prediction, timestamp_resolution)
+                VALUES (?, NULL, NULL, ?, ?, NULL, ?)
+                """, (ticket_id, 1 if actual_sla_violated else 0, float(actual_resolution_time),
+                      datetime.now().isoformat()))
+            conn.commit()
+            conn.close()
+            return exists
+
+    @staticmethod
+    def list_resolved_predictions(days: int = 30) -> List[Dict[str, Any]]:
+        """Linhas com previsão E desfecho (para Brier móvel / MdAE)."""
+        with _db_lock:
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+            SELECT ticket_id, predicted_risk, predicted_time,
+                   actual_sla_violated, actual_resolution_time,
+                   timestamp_prediction, timestamp_resolution
+            FROM prediction_audit
+            WHERE actual_sla_violated IS NOT NULL AND predicted_risk IS NOT NULL
+            """)
+            rows = cursor.fetchall()
+            conn.close()
+            return [dict(r) for r in rows]
+
+    @staticmethod
+    def clear_prediction_audit() -> None:
+        """Limpa a auditoria de predições (uso em testes; jamais em produção)."""
+        with _db_lock:
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM prediction_audit")
+            conn.commit()
+            conn.close()
 
     @staticmethod
     def log_audit(action: str, user_sub: str, incident_id: Optional[str] = None, details: Optional[Dict[str, Any]] = None):

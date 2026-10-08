@@ -23,6 +23,36 @@ export const SHAPWaterfallModal: React.FC<SHAPWaterfallModalProps> = ({
   // Sort factors by contribution magnitude
   const sortedFactors = [...factors].sort((a, b) => Math.abs(b.value) - Math.abs(a.value));
   const dominantFactor = sortedFactors[0]?.display_name || 'Backlog elevado da squad';
+  // Coalizões causais (Grouped SHAP, Fase 5): Φ_G por grupo, ordenadas por |Φ|.
+  const GROUP_LABELS: Record<string, string> = {
+    sobrecarga_turno: 'Sobrecarga de Turno',
+    capacidade_tecnica: 'Capacidade Técnica',
+    severidade_semantica: 'Severidade Semântica',
+    outros: 'Outros fatores',
+  };
+  const groupPhi: Record<string, number> = {};
+  for (const f of sortedFactors) {
+    const g = f.group || 'outros';
+    groupPhi[g] = (groupPhi[g] ?? 0) + f.value;
+  }
+  const groupOrder = Object.entries(groupPhi)
+    .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]))
+    .map(([g]) => g);
+  const orderedFactors = groupOrder.flatMap((g) =>
+    sortedFactors.filter((f) => (f.group || 'outros') === g));
+  let lastGroup = '';
+  const groupHeader = (g: string) => {
+    const phi = groupPhi[g] ?? 0;
+    lastGroup = g;
+    return (
+      <div key={`grp-${g}`} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 'var(--text-xs)', fontWeight: 'bold', color: 'var(--color-text-primary)', paddingTop: '6px' }}>
+        <span>{GROUP_LABELS[g] || g}</span>
+        <span style={{ fontFamily: 'var(--font-family-mono)', color: phi >= 0 ? 'var(--color-risk-critical)' : 'var(--color-risk-low)' }}>
+          Φ = {phi >= 0 ? '+' : ''}{phi.toFixed(3)}
+        </span>
+      </div>
+    );
+  };
 
   return (
     <div
@@ -144,13 +174,17 @@ export const SHAPWaterfallModal: React.FC<SHAPWaterfallModalProps> = ({
               <span style={{ color: 'var(--color-text-muted)', textAlign: 'right' }}>Taxa média</span>
             </div>
 
-            {/* Feature contributions */}
-            {sortedFactors.map((factor, idx) => {
+            {/* Feature contributions, grouped by causal coalition (Fase 5) */}
+            {orderedFactors.map((factor, idx) => {
               const isPositive = factor.impact === 'positive' || factor.value > 0;
               const valPct = Math.round(Math.abs(factor.value) * 100);
               const barWidth = Math.min(100, Math.max(8, valPct * 2.2));
+              const g = factor.group || 'outros';
+              const header = g !== lastGroup ? groupHeader(g) : null;
 
               return (
+                <React.Fragment key={`${g}-${idx}`}>
+                {header}
                 <div
                   key={idx}
                   style={{
@@ -203,6 +237,7 @@ export const SHAPWaterfallModal: React.FC<SHAPWaterfallModalProps> = ({
                     {factor.feature_value_str || 'Sinal detectado'}
                   </span>
                 </div>
+                </React.Fragment>
               );
             })}
 

@@ -6,10 +6,12 @@ import io
 from backend.models.schemas import (
     Incident, Forecast, Regime, Cluster, MLOpsStatus, MetricsOverview,
     AssignRequest, EscalateRequest, RegimeOverrideRequest,
-    LoginRequest, AuthTokenResponse
+    LoginRequest, AuthTokenResponse, PredictRequest, PredictionResponse,
+    FeedbackResolution, DriftStatusResponse, ModelAuditMetrics, GroupedShap,
 )
 from backend.services.itsm_data import itsm_store, GROUPS, PRODUCTS, CATEGORIES
 from backend.services.ml_engine import ml_engine
+from backend.db.database import DatabaseRepository
 from backend.auth.security import (
     create_access_token, get_current_user, require_role, ROLES,
     verify_password, check_login_rate_limit, revoke_token, security_bearer,
@@ -198,9 +200,101 @@ def notify_incident(
 @router.post("/incidents/simulate", response_model=Incident)
 def simulate_new_incident(user: Dict[str, Any] = Depends(require_role(["admin", "operator"]))):
     """Simulates an incoming real-time incident in the stream"""
+    if ml_engine.auto_block:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail=f"Inferência automática bloqueada: {ml_engine.auto_block_reason}")
     new_inc = itsm_store.create_synthetic_incoming(user_sub=user.get("sub", "operator"))
     logger.info(f"Synthetic incident {new_inc.id} injected by {user.get('sub')}.")
     return new_inc
+
+@router.post("/predict", response_model=PredictionResponse)
+def predict_full(payload: PredictRequest,
+                 user: Dict[str, Any] = Depends(require_role(["admin", "operator"]))):
+    """Inferência completa: risco calibrado + MTTR + SHAP agrupado (Fase 7.5).
+
+    503 quando o auto-block de degradação está ativo (Fase 6.2).
+    """
+    if ml_engine.auto_block:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail=f"Inferência automática bloqueada: {ml_engine.auto_block_reason}")
+    import time as _time
+    t0 = _time.perf_counter()
+    try:
+        p_raw, p_cal = ml_engine.predict_incident_proba(
+            payload.title, payload.priority, payload.group, payload.product,
+            payload.config_item, payload.hour)
+    except RuntimeError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
+    mttr = ml_engine.predict_mttr_minutes(
+        payload.title, payload.priority, payload.group, payload.product,
+        payload.config_item, payload.hour)
+    X = ml_engine._row_X(ml_engine._row_frame(
+        payload.title, payload.priority, payload.group, payload.product,
+        payload.config_item, payload.hour))
+    groups, _, _, _ = ml_engine.grouped_shap(X)
+    flat = ml_engine.calculate_incident_shap({
+        "title": payload.title, "priority": payload.priority, "group": payload.group,
+        "product": payload.product, "config_item": payload.config_item, "hour": payload.hour,
+        "duration_seconds": 14, "is_automated_fp": False})
+    elapsed_ms = round((_time.perf_counter() - t0) * 1000, 2)
+    if elapsed_ms > 45.0:
+        logger.warning(f"/predict excedeu 45 ms: {elapsed_ms} ms.")
+    DatabaseRepository.record_prediction(
+        ticket_id=f"predict-{user.get('sub', 'anon')}-{int(_time.time())}",
+        predicted_risk=p_cal, predicted_time=mttr)
+    return PredictionResponse(
+        calibrated_risk_score=p_cal,
+        risk_score=max(1, min(99, int(round(p_cal * 100.0)))),
+        risk_category=ml_engine.risk_category(p_cal),
+        threshold_tau_star=ml_engine.threshold_tau,
+        estimated_mttr_minutes=mttr,
+        grouped_shap_explanations=[GroupedShap(**g) for g in groups],
+        shap_factors=flat,
+        claim_label="measured",
+    )
+
+
+@router.post("/feedback/resolution")
+def post_resolution_feedback(payload: FeedbackResolution,
+                             user: Dict[str, Any] = Depends(require_role(["admin", "operator"]))):
+    """Registra o desfecho real do ticket p/ auditoria contínua (Fase 6.2)."""
+    matched = DatabaseRepository.record_resolution(
+        payload.ticket_id, payload.actual_sla_violado, payload.actual_resolution_time)
+    DatabaseRepository.log_audit("FEEDBACK", user.get("sub", "operator"), payload.ticket_id,
+                                 {"matched_prediction": matched})
+    return {"status": "success", "matched_prediction": matched}
+
+
+@router.get("/metrics/drift", response_model=DriftStatusResponse)
+def get_drift_metrics(user: Dict[str, Any] = Depends(get_current_user)):
+    """PSI por feature + Brier móvel + estado do auto-block (Fase 6/7.5)."""
+    panel = ml_engine.psi_panel()
+    rollup = ml_engine.rollup_audit_job()
+    severe = sum(1 for p in panel if p.get("status") == "severe")
+    return DriftStatusResponse(
+        psi_overall=round(float(sum(p["psi"] for p in panel) / max(1, len(panel))), 4) if panel else 0.0,
+        psi_panel=[{**p, "severe_count_hint": severe} for p in panel],
+        brier_rolling_7d=rollup.get("brier_rolling_7d"),
+        mdae_mttr_7d=rollup.get("mdae_mttr_7d"),
+        auto_block=bool(rollup.get("auto_block", ml_engine.auto_block)),
+        auto_block_reason=ml_engine.auto_block_reason,
+    )
+
+
+@router.get("/metrics/audit", response_model=ModelAuditMetrics)
+def get_model_audit(user: Dict[str, Any] = Depends(get_current_user)):
+    """Métricas de auditoria do modelo em produção (Fase 7.1)."""
+    return ModelAuditMetrics(
+        model_version=ml_engine.model_version,
+        brier_blind=ml_engine.brier,
+        brier_gate=ml_engine.brier_gate,
+        decile_max_err=ml_engine.decile_max_err,
+        mdape_mttr=ml_engine.mdape_mttr,
+        cost_reduction_pct=float(ml_engine.tau_report.get("cost_reduction_pct", 0.0)),
+        recall_at_star=float(ml_engine.tau_report.get("recall_at_star", 0.0)),
+        tau_star=ml_engine.threshold_tau,
+        walk_folds=ml_engine.walk_report,
+    )
 
 @router.get("/forecast", response_model=Forecast)
 def get_forecast(horizon: str = Query("D+7"), user: Dict[str, Any] = Depends(get_current_user)):

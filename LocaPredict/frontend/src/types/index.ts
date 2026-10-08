@@ -14,6 +14,7 @@ export interface SHAPFactor {
   explainer?: string;
   explainer_version?: string;
   fidelity_topk?: number;
+  group?: string;
 }
 
 export interface Incident {
@@ -45,6 +46,8 @@ export interface Incident {
   threshold_tau?: number;
   claim_label?: 'measured' | 'projection';
   p1_n1_warning?: string;
+  risk_category?: 'CRITICAL' | 'WARNING' | 'SAFE';
+  estimated_mttr_minutes?: number;
 }
 
 export interface DataPoint {

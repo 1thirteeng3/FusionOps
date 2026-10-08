@@ -11,3 +11,4 @@ pytest>=8.0.0
 httpx>=0.27.0
 shap>=0.45.0  # TreeExplainer for verified SHAP attributions (Constitution III, Gate 5)
 hdbscan>=0.8.0  # Density-based semantic clustering with DBCV validity (Constitution IV, Gate 5)
+lightgbm>=4.0.0  # GBM heads: focal-loss SLA + quantile-median/Tweedie MTTR (Fase 3)

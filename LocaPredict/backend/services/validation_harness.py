@@ -6,7 +6,8 @@ utilities (WAPE, seasonal-naive baseline, Diebold-Mariano). No thresholds are
 learned from test data here; ACR-001..ACR-003 live frozen in plan.md.
 """
 import numpy as np
-from typing import Dict, Any, Tuple
+import pandas as pd
+from typing import Dict, Any, Tuple, List, Optional
 from sklearn.model_selection import StratifiedKFold, cross_val_predict
 from sklearn.metrics import (roc_auc_score, average_precision_score, recall_score,
                              precision_score, f1_score, brier_score_loss)
@@ -121,3 +122,115 @@ def diebold_mariano_pvalue(e1: np.ndarray, e2: np.ndarray) -> float:
         return 1.0
     stat = mean_d / np.sqrt(var_dm)
     return round(float(2 * (1 - t_dist.cdf(abs(stat), df=n - 1))), 4)
+
+
+# ======================================================================
+# Fase 1 — Walk-Forward temporal com janela expansiva (1.1)
+# ======================================================================
+def walk_forward_folds(dates: np.ndarray, n_folds: int = 3,
+                       min_train_months: int = 3) -> List[Dict[str, Any]]:
+    """Dobra k sobre meses ordenados m_1..m_M (floor mensal de dt_abertura):
+    treino = todos os meses anteriores ao mês de calibração; calibração =
+    mês imediatamente anterior ao teste; teste = 1 mês cego. Aquecimento:
+    exige ≥ min_train_months meses de treino; dobras degeneradas (teste sem
+    positivos) são puladas com registro explícito. NENHUM shuffle em nenhum
+    ponto: a ordem temporal é a validação.
+    """
+    d = pd.to_datetime(np.asarray(dates)).values.astype("datetime64[M]")
+    months = np.unique(d)  # já ordenado; preserva dtype datetime64[M]
+    folds: List[Dict[str, Any]] = []
+    if len(months) < min_train_months + 2:
+        return folds
+    for test_m in months[-n_folds:]:
+        calib_m = test_m - np.timedelta64(1, "M")
+        train_mask = d < calib_m
+        calib_mask = d == calib_m
+        test_mask = d == test_m
+        info: Dict[str, Any] = {
+            "test_month": str(test_m),
+            "n_train": int(train_mask.sum()),
+            "n_calib": int(calib_mask.sum()),
+            "n_test": int(test_mask.sum()),
+            "skipped": "",
+        }
+        if train_mask.sum() == 0 or test_mask.sum() == 0:
+            info["skipped"] = "empty train or test month"
+        folds.append({**info, "train": train_mask, "calib": calib_mask, "test": test_mask})
+    return folds
+
+
+def purge_overlaps(train_mask: np.ndarray, end_times: np.ndarray,
+                   cutoff_end: np.ndarray) -> Tuple[np.ndarray, int]:
+    """Purga de segurança (1.1, López de Prado): remove do treino as linhas
+    cujo desfecho (t_end) ocorre em/ após o início do período seguinte
+    (cutoff). Rótulos realizados no futuro não treinam o passado.
+    Retorna (máscara limpa, nº removido)."""
+    end = pd.to_datetime(np.asarray(end_times)).values
+    cut = pd.to_datetime(np.asarray(cutoff_end)).values if np.asarray(cutoff_end).size else None
+    if cut is None:
+        return train_mask, 0
+    leak = train_mask & (end > cut)
+    clean = train_mask & ~leak
+    return clean, int(leak.sum())
+
+
+# ======================================================================
+# Fase 4 — limiar econômico τ* (4.2)
+# ======================================================================
+C_FP_DEFAULT = 30.0    # R$: inspecionar um falso alarme (analista sênior)
+C_FN_DEFAULT = 600.0   # R$: deixar um SLA crítico estourar (multa/indisp.)
+
+
+def optimize_cost_threshold(y_true: np.ndarray, y_probs: np.ndarray,
+                            c_fp: float = C_FP_DEFAULT,
+                            c_fn: float = C_FN_DEFAULT,
+                            recall_floor: Optional[float] = 0.80
+                            ) -> Dict[str, Any]:
+    """τ* = argmin C_FP·FP(τ) + C_FN·FN(τ), com piso de recall divulgado.
+
+    Se o ótimo econômico viola o piso (ACR-002), o gate é declarado BLOQUEADO
+    em vez de mascarado: retorna ambos os candidatos e a decisão.
+    """
+    y_true = np.asarray(y_true).astype(int)
+    y_probs = np.asarray(y_probs, dtype=float)
+    base_cost = float(c_fp * ((y_probs >= 0.5).astype(int) & (y_true == 0)).sum()
+                      + c_fn * ((y_probs < 0.5).astype(int) & (y_true == 1)).sum())
+    best = {"tau": 0.5, "cost": base_cost, "recall": 0.0}
+    for tau in np.arange(0.01, 1.0, 0.01):
+        pred = (y_probs >= tau).astype(int)
+        fp = int(((pred == 1) & (y_true == 0)).sum())
+        fn = int(((pred == 0) & (y_true == 1)).sum())
+        tp = int(((pred == 1) & (y_true == 1)).sum())
+        rec = tp / max(1, tp + fn)
+        cost = float(c_fp * fp + c_fn * fn)
+        if cost < best["cost"]:
+            best = {"tau": round(float(tau), 2), "cost": cost, "recall": round(float(rec), 4),
+                    "fp": fp, "fn": fn, "tp": tp}
+    gate = "PASS" if (recall_floor is None or best["recall"] >= recall_floor) else "BLOCKED"
+    return {"tau_star": best["tau"], "cost_star": best["cost"],
+            "recall_at_star": best["recall"], "fp": best["fp"], "fn": best["fn"],
+            "cost_static_05": base_cost,
+            "cost_reduction_pct": round(100 * (base_cost - best["cost"]) / max(1e-9, base_cost), 1),
+            "recall_floor": recall_floor, "gate": gate, "c_fp": c_fp, "c_fn": c_fn}
+
+
+# ======================================================================
+# Fase 6 — PSI de deriva (6.1)
+# ======================================================================
+def population_stability_index(ref: np.ndarray, cur: np.ndarray,
+                               bins: int = 10) -> Dict[str, Any]:
+    """PSI sobre decis de referência. <0.1 estável; 0.1-0.2 alerta; >0.2 severo."""
+    r = np.asarray(ref, dtype=float)
+    c = np.asarray(cur, dtype=float)
+    qs = np.quantile(r, np.linspace(0, 1, bins + 1))
+    qs[0], qs[-1] = -np.inf, np.inf
+    pr, _ = np.histogram(r, bins=qs)
+    pc, _ = np.histogram(c, bins=qs)
+    pr = pr / max(1, pr.sum())
+    pc = pc / max(1, pc.sum())
+    eps = 1e-6
+    pr = np.clip(pr, eps, None)
+    pc = np.clip(pc, eps, None)
+    psi = float(np.sum((pc - pr) * np.log(pc / pr)))
+    status = "stable" if psi < 0.1 else ("watch" if psi <= 0.2 else "severe")
+    return {"psi": round(psi, 4), "status": status}

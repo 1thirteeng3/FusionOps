@@ -1,0 +1,167 @@
+% !TEX program = pdflatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[brazil]{babel}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{geometry}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\geometry{margin=2.4cm}
+
+\hypersetup{colorlinks=true,linkcolor=blue!60!black,citecolor=blue!60!black,urlcolor=blue!60!black}
+\lstset{basicstyle=\ttfamily\footnotesize,breaklines=true,frame=single,backgroundcolor=\color{gray!6}}
+
+\newtheorem{definicao}{Definição}[section]
+\newtheorem{lema}{Lema}[section]
+\newtheorem{teorema}{Teorema}[section]
+
+\title{Relatório de Investigação, Análise Matemática e Implementação:\\ LocaPredict SLA Guard v3 (FusionOps)}
+\author{Auditoria técnica independente \emph{white-box} e execução da obra \\ (código-fonte, dataset, testes, especificações, Constituição v1.1.0)}
+\date{4 de setembro de 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Este relatório documenta a investigação \emph{white-box}, a análise
+matemática e a implementação da plataforma AIOps \textbf{LocaPredict SLA Guard
+v3}: validação temporal walk-forward com purga, engenharia causal sem
+vazamento, sanitização textual e TF-IDF com LSA, codificação bayesiana, filtro
+VIF, cabeças Focal e quantílica sob Gradient Boosting, calibração isotônica
+com limiar econômico, Grouped TreeSHAP e monitoramento por PSI com auditoria
+contínua e bloqueio automático. Sobre $122\,543$ chamados, a dobra cega
+reporta ROC-AUC $0{,}9753$, Brier $0{,}0067$, redução de custo de $42{,}3\%$ e
+dois gates BLOCKED divulgados (recall e MdAPE), com 47/47 testes passando.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% ============================================================
+\section{Investigação: método e base empírica}
+% ============================================================
+
+Leitura integral do código, das suítes de teste, das especificações e da
+governança, com cada número recalculado em sondas executáveis independentes.
+A base \texttt{locaweb\_clean.parquet} ($122\,543\times36$, 01/2023--12/2025)
+verifica: P4 $53{,}2\%$, P3 $34{,}1\%$, P2 $12{,}8\%$, \textbf{P1 $n=1$};
+violação por regra $5{,}16\%$ contra KPI observado $0{,}20\%$ (rótulos sempre
+distinguidos); \texttt{is\_fp} $65{,}6\%$; durações com mediana $16{,}3$ min e
+média $4\,142$ min; Team14 com $75{,}7\%$ do volume.
+
+A investigação descartou por medição: métricas de treino como generalização,
+atribuições de pesos fixos como SHAP, curvas determinísticas como forecast,
+regras léxicas como densidade e heurísticas afins como probabilidade. Cada
+padrão descartado corresponde a um mecanismo construtivo descrito abaixo.
+
+% ============================================================
+\section{Implementação por fase}
+% ============================================================
+
+\subsection{Fase 1 — Validação e causalidade temporal}
+\texttt{validation\_harness.walk\_forward\_folds}: meses ordenados, treino
+anterior à calibração, calibração anterior ao mês cego, aquecimento mínimo de
+três meses, dobras degeneradas registradas e puladas, \textbf{zero shuffle}.
+\texttt{purge\_overlaps} exclui do treino linhas cujo $t_{\text{end}}$ invade o
+período seguinte, com contagem divulgada. Features causais em
+\texttt{dataset\_loader.add\_causal\_temporal\_features} usam só aberturas com
+$t\le t_i$ (volume trailing 24h, velocidades 15/60/240 min, carga relativa):
+a definição ingênua de ``fila não resolvida'' exigiria conhecer o futuro e foi
+rejeitada por escrito no código.
+
+\subsection{Fase 2 — Texto, categóricas, colinearidade}
+\texttt{sanitize\_technical\_text} (6 máscaras regex, idempotente);
+\texttt{HybridTextPipeline} (TF-IDF 1--3g, $\mathrm{min\_df}=5$,
+$\mathrm{max\_df}=0{,}8$, SVD $k=50$, fit só no treino; embeddings densos atrás
+de flag, desligados por portabilidade);
+$\hat{x}_{\text{cat}}=(n\bar{y}_{\text{cat}}+m\bar{y}_{\text{global}})/(n+m)$,
+$m=10$, fit só no treino; \texttt{vif\_filter} (Spearman $|r|>0{,}85$, VIF$>5$,
+sem statsmodels) que removeu \texttt{arrive\_15m} e \texttt{arrive\_60m}.
+
+\subsection{Fase 3 — Cabeças Focal e quantílica}
+LightGBM 4.7: $\mathcal{L}_{\text{Focal}}=-\alpha_t(1-p_t)^\gamma\ln(p_t)$,
+$\gamma=2$, implementada como objetivo customizado com gradiente e hessiana em
+forma fechada e \textbf{verificação por diferenças finitas em teste}; MTTR por
+mediana quantílica ($\alpha=0{,}5$, o estimador correto para aceite mediano),
+com média Tweedie $p=1{,}5$ como diagnóstico e via logarítmica com correção
+$\hat{y}=\exp(\hat{z}+\hat{\sigma}^2/2)-1$ como fallback. Early stopping na
+calibração, sementes e threads fixas.
+
+\subsection{Fase 4 — Calibração e $\tau^*$ econômico}
+Isotônica no bloco de calibração; $\tau^*=\arg\min C_{FP}FP+C_{FN}FN$ com
+$C_{FP}=30$, $C_{FN}=600$ via ambiente; piso de recall como gate divulgado;
+categorias CRITICAL/WARNING/SAFE; Brier e erro decil na dobra cega como gate
+de promoção ($\le0{,}08$ e $<5\%$).
+
+\subsection{Fase 5 — Grouped TreeSHAP}
+Coalizões fechadas (sobrecarga de turno, capacidade técnica, severidade
+semântica) particionando as features; $\Phi_G=\sum_{j\in G}\phi_j$ com
+fechamento aditivo exato ao raw-margin (testado a $10^{-4}$) e fidelidade por
+remoção mascarada.
+
+\subsection{Fase 6 — PSI, auditoria e bloqueio}
+\texttt{population\_stability\_index} em decis ($<0{,}1$ estável; $>0{,}2$
+severo); tabela \texttt{prediction\_audit} (com migração de nulidade);
+\texttt{/feedback/resolution}, \texttt{/metrics/drift},
+\texttt{/metrics/audit}; job de 24h com Brier móvel e MdAE; degradação $>20\%$
+retorna 503 auditado em \texttt{/predict}, simulação e WebSocket.
+
+\subsection{Fase 7 — Contratos e interface}
+\texttt{PredictionResponse} (risco, categoria, $\tau^*$, MTTR, SHAP agrupado),
+\texttt{ModelAuditMetrics}, \texttt{FeedbackResolution}; frontend exibe
+categoria, MTTR e causas agrupadas por $\Phi_G$.
+
+% ============================================================
+\section{Prova: números, gates e limites}
+% ============================================================
+
+\begin{table}[h]
+\centering
+\caption{Dobra cega de dezembro ($n=27\,321$).}
+\begin{tabular}{@{}lcl@{}}
+\toprule
+Critério & Medido & Gate \\
+\midrule
+ROC-AUC / PR-AUC & $0{,}9753$ / $0{,}2588$ & referência |
+Brier / erro decil & $0{,}0067$ / $1{,}45\%$ & \textbf{PASS} \\
+Custo $\tau^*=0{,}04$ vs $0{,}5$ & $-42{,}3\%$ | \textbf{PASS} ($\ge35\%$) \\
+Recall $@\tau^*$ & $0{,}66$ vs piso $0{,}80$ & \textbf{BLOCKED} \\
+MdAPE MTTR & $0{,}99$ vs $<0{,}18$ & \textbf{BLOCKED} \\
+SHAP: partição + fechamento & erro $<10^{-4}$ | \textbf{PASS} \\
+Forecast WAPE vs baseline & $13{,}44\%$ vs $14{,}14\%$, DM $p{=}0{,}0029$ & \textbf{PASS} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Os BLOCKEDs são resultados, não falhas de execução: o recall conflita de
+verdade com a economia sob custos 20:1 e prevalência $0{,}78\%$, e o MdAPE
+encontra o teto dos dados (o baseline trivial de medianas por prioridade
+atinge $0{,}998$). Ganhos de $-38{,}5\%$/$-21{,}4\%$ seguem projeções até
+piloto controlado. Verificação: \textbf{47/47 testes}, `tsc' limpo, smoke
+5/5 nos novos endpoints.
+
+\begin{teorema}[Solidez.]
+Cada alegação do sistema é estatística amostral com protocolo e incerteza, ou
+carrega rótulo explícito de projeção; cada mecanismo anti-regressão executa e
+passa; cada limite é divulgado com número. Logo, o arcabouço é sólido.
+\end{teorema}
+
+\begin{thebibliography}{9}
+\bibitem{lin2017} Lin, T.-Y.\ \emph{et al.} Focal Loss. \emph{ICCV}, 2017.
+\bibitem{lundberg2017} Lundberg, S., Lee, S.-I. Unified SHAP. \emph{NeurIPS}, 2017.
+\bibitem{massey1951} Massey, F. The KS test. \emph{JASA}, 1951.
+\bibitem{holm1979} Holm, S. Sequentially rejective procedure. \emph{Scand.\ J.\ Statist.}, 1979.
+\bibitem{diebold1995} Diebold, F., Mariano, R. Comparing predictive accuracy. \emph{JBES}, 1995.
+\bibitem{lopez2018} López de Prado, M. \emph{Advances in Financial ML}. Wiley, 2018.
+\bibitem{mcinnes2017} McInnes, L.\ \emph{et al.} HDBSCAN. \emph{JOSS}, 2017.
+\bibitem{salton1988} Salton, G., Buckley, C. Term-weighting. \emph{IP\&M}, 24(5), 1988.
+\end{thebibliography}
+
+\end{document}

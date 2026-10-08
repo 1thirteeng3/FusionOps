@@ -1,10 +1,13 @@
 import os
+import re
 import sqlite3
 import pandas as pd
 import numpy as np
 import json
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Tuple, Optional
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import TruncatedSVD
 from backend.utils.logger import logger
 from backend.models.schemas import SHAPFactor
 
@@ -226,6 +229,209 @@ def group_index(group: str, df: Optional[pd.DataFrame] = None) -> float:
     if group in groups:
         return float(groups.index(group))
     return float(len(groups))  # unknown bucket (was: collision with index 0)
+
+
+# ======================================================================
+# Fase 2 — sanitização textual com máscaras canônicas (2.1)
+# ======================================================================
+_MASK_PATTERNS: List[Tuple[str, str]] = [
+    (r"\b\d{1,3}(\.\d{1,3}){3}\b", "__IP__"),                       # IPv4
+    (r"\b(?:[0-9a-fA-F]{0,4}:){2,}[0-9a-fA-F:]{2,}\b", "__IP__"),   # IPv6
+    (r"0x[0-9a-fA-F]+|\b[A-Z]{3,}-\d{3,}\b", "__ERR_CODE__"),       # hex / códigos
+    (r"https?://\S+|www\.\S+", "__URL__"),                         # URLs / FQDNs
+    (r"\b(srv|db|app|node|web)\d{1,4}\b", "__SERVER_NAME__"),       # hostnames
+    (r"\b[0-9a-fA-F-]{36}\b", "__UUID__"),                         # UUIDs / sessões
+]
+_MASK_RES = [(re.compile(p, re.IGNORECASE), tok) for p, tok in _MASK_PATTERNS]
+
+
+def sanitize_technical_text(text: str) -> str:
+    """Collapse high-cardinality technical tokens to canonical masks (2.1).
+
+    Preserves semantics (an IP was present) while removing identifiers that
+    fragment TF-IDF statistics. Idempotent and deterministic.
+    """
+    s = str(text or "")
+    for rx, tok in _MASK_RES:
+        s = rx.sub(tok, s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+# ======================================================================
+# Fase 2 — representação textual: ST denso (opcional) ou TF-IDF+LSA (2.2)
+# ======================================================================
+N_TEXT_DIMS = 50
+
+
+def _try_sentence_transformer():
+    """ST compacto PT/EN se instalado E habilitado (opcional, 2.2).
+
+    Default: None. torch (~GBs de RAM/imagem) viola a regra de portabilidade
+    da Constituição para o deploy free; o caminho TF-IDF+LSA é o ativo.
+    """
+    if os.getenv("LOCAPREDICT_USE_ST", "0") != "1":
+        return None
+    try:
+        from sentence_transformers import SentenceTransformer
+        return SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+    except Exception as e:
+        logger.warning(f"SentenceTransformer indisponível; usando TF-IDF+LSA: {e}")
+        return None
+
+
+class HybridTextPipeline:
+    """TF-IDF bi/tri-gramas (min_df=5, max_df=0.8) + SVD truncada k=50 (2.2).
+
+    Fit exclusivo no treino da dobra; transform puro na inferência/teste.
+    """
+
+    def __init__(self, k: int = N_TEXT_DIMS):
+        self.k = k
+        self.st_model = _try_sentence_transformer()
+        self.vectorizer: Optional[TfidfVectorizer] = None
+        self.svd: Optional[TruncatedSVD] = None
+        self.mode = "st" if self.st_model is not None else "tfidf-lsa"
+
+    def fit(self, texts: List[str]):
+        clean = [sanitize_technical_text(t) for t in texts]
+        if self.mode == "st":
+            return self
+        self.vectorizer = TfidfVectorizer(ngram_range=(1, 3), min_df=5, max_df=0.8)
+        X = self.vectorizer.fit_transform(clean)
+        k = min(self.k, max(1, X.shape[1] - 1), max(1, X.shape[0] - 1))
+        self.svd = TruncatedSVD(n_components=k, random_state=42)
+        self.svd.fit(X)
+        return self
+
+    def transform(self, texts: List[str]) -> np.ndarray:
+        clean = [sanitize_technical_text(t) for t in texts]
+        if self.mode == "st":
+            vecs = self.st_model.encode(clean, show_progress_bar=False)
+            return np.asarray(vecs, dtype=float)
+        assert self.vectorizer is not None and self.svd is not None, "pipeline not fitted"
+        return np.asarray(self.svd.transform(self.vectorizer.transform(clean)), dtype=float)
+
+    @property
+    def dim(self) -> int:
+        if self.mode == "st":
+            return 384
+        return int(self.svd.n_components) if self.svd is not None else self.k
+
+
+# ======================================================================
+# Fase 2 — codificação bayesiana de categóricas (2.3)
+# ======================================================================
+class BayesianTargetEncoder:
+    """x_cat = (n*y_cat + m*y_global) / (n + m). Fit só no treino da dobra."""
+
+    def __init__(self, m: float = 10.0):
+        self.m = float(m)
+        self.maps: Dict[str, Dict[Any, float]] = {}
+        self.global_mean = 0.0
+
+    def fit(self, df: pd.DataFrame, cols: List[str], y: pd.Series):
+        self.global_mean = float(np.mean(y))
+        for c in cols:
+            stats = y.groupby(df[c].astype(str)).agg(["mean", "count"])
+            self.maps[c] = {
+                k: float((row["count"] * row["mean"] + self.m * self.global_mean)
+                         / (row["count"] + self.m))
+                for k, row in stats.iterrows()
+            }
+        return self
+
+    def transform(self, df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+        out = pd.DataFrame(index=df.index)
+        for c in cols:
+            mapping = self.maps.get(c, {})
+            out[c + "__te"] = df[c].astype(str).map(mapping).fillna(self.global_mean).astype(float)
+        return out
+
+
+# ======================================================================
+# Fase 1 — variáveis temporais causais, só passado (1.2) + VIF (2.4)
+# ======================================================================
+def add_causal_temporal_features(df: pd.DataFrame,
+                                 train_groups_weekday: Optional[pd.DataFrame] = None
+                                 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Volume concorrente, velocidade de chegada e carga — estritamente passado.
+
+    NOTA DE HONESTIDADE: "chamados ainda não resolvidos em t_i" exigiria saber
+    o futuro (quando cada um resolve). Implementação causal correta: janelas
+    de trailing apenas com aberturas (t_open ≤ t_i), sem nenhum end_time.
+    Retorna (df com features, baseline grupo×weekday para inferência).
+    """
+    d = df.copy()
+    d["t_open"] = pd.to_datetime(d["aberto"], errors="coerce")
+    d = d.sort_values("t_open").reset_index(drop=True)
+    opens = d["t_open"].values.astype("datetime64[s]").astype("int64")
+
+    # Volume concorrente: aberturas nas últimas 24h (trailing, sem futuro).
+    d["queue_volume_24h"] = np.searchsorted(opens, opens) - np.searchsorted(opens, opens - 24 * 3600)
+
+    # Velocidade de chegada por produto: 15/60/240 min trailing.
+    for wmin, col in ((15, "arrive_15m"), (60, "arrive_60m"), (240, "arrive_240m")):
+        vals = np.zeros(len(d), dtype=float)
+        for _, idx in d.groupby("produto_clean").groups.items():
+            ii = np.asarray(sorted(idx))
+            to = opens[ii]
+            vals[ii] = np.searchsorted(to, to) - np.searchsorted(to, to - wmin * 60)
+        d[col] = vals
+
+    # Carga por grupo: pendentes (trailing 24h) / baseline grupo×weekday.
+    d["wd"] = pd.to_datetime(d["t_open"]).dt.weekday.fillna(2).astype(int)
+    grp_pending = np.zeros(len(d), dtype=float)
+    for _, idx in d.groupby("grupo_clean").groups.items():
+        ii = np.asarray(sorted(idx))
+        to = opens[ii]
+        grp_pending[ii] = np.searchsorted(to, to) - np.searchsorted(to, to - 24 * 3600)
+    d["group_pending_24h"] = grp_pending
+    if train_groups_weekday is None:
+        base = d.groupby(["grupo_clean", "wd"])["group_pending_24h"].mean().rename("base").reset_index()
+    else:
+        base = train_groups_weekday
+    d = d.merge(base, on=["grupo_clean", "wd"], how="left")
+    d["base"] = d["base"].fillna(d["group_pending_24h"].mean() if len(d) else 1.0).clip(lower=1.0)
+    d["load_ratio"] = d["group_pending_24h"] / d["base"]
+    return d, base[["grupo_clean", "wd", "base"]]
+
+
+def vif_filter(X: pd.DataFrame, thresh: float = 5.0, corr: float = 0.85) -> Tuple[List[str], Dict[str, Any]]:
+    """Spearman |r|>corr ou VIF>thresh → descarta redundante (2.4, sem statsmodels)."""
+    kept = list(X.columns)
+    dropped: Dict[str, Any] = {}
+    # 1) correlação bivariada: mantém a de maior variância do par.
+    if len(kept) > 1:
+        C = X[kept].corr(method="spearman").abs()
+        from itertools import combinations
+        for a, b in combinations(list(kept), 2):
+            if a not in kept or b not in kept:
+                continue
+            if C.loc[a, b] > corr:
+                drop = a if X[a].var() < X[b].var() else b
+                kept.remove(drop)
+                dropped[drop] = {"reason": f"spearman|r|={C.loc[a, b]:.3f}>{corr}", "kept_other": b if drop == a else a}
+    # 2) VIF manual via OLS (numpy lstsq): VIF_j = 1/(1-R²_j).
+    changed = True
+    while changed and len(kept) > 1:
+        changed = False
+        vifs = {}
+        A = X[kept].values.astype(float)
+        for j in range(len(kept)):
+            y = A[:, j]
+            Xo = np.delete(A, j, axis=1)
+            Xo1 = np.column_stack([np.ones(len(Xo)), Xo])
+            coef, *_ = np.linalg.lstsq(Xo1, y, rcond=None)
+            ss_res = float(((y - Xo1 @ coef) ** 2).sum())
+            ss_tot = float(((y - y.mean()) ** 2).sum())
+            r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+            vifs[kept[j]] = 1.0 / max(1e-9, 1.0 - min(r2, 0.999999999))
+        worst = max(vifs, key=vifs.get)
+        if vifs[worst] > thresh:
+            kept.remove(worst)
+            dropped[worst] = {"reason": f"VIF={vifs[worst]:.1f}>{thresh}"}
+            changed = True
+    return kept, {"dropped": dropped}
 
 
 if __name__ == "__main__":

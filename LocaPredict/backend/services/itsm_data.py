@@ -69,7 +69,17 @@ class ITSMDataStore:
                 for inc_dict in saved_incidents:
                     factors = [SHAPFactor(**f) if isinstance(f, dict) else f for f in inc_dict.get("shap_factors", [])]
                     inc_dict["shap_factors"] = factors
-                    inc = Incident(**inc_dict)
+                    # Defesa contra linhas persistidas pré-validação estrita:
+                    # trunca para os limites do schema em vez de travar o boot.
+                    if isinstance(inc_dict.get("title"), str):
+                        inc_dict["title"] = inc_dict["title"][:200]
+                    if isinstance(inc_dict.get("description"), str):
+                        inc_dict["description"] = inc_dict["description"][:2000]
+                    try:
+                        inc = Incident(**inc_dict)
+                    except Exception as e:
+                        logger.warning(f"Skipping corrupt persisted incident {inc_dict.get('id')}: {e}")
+                        continue
                     self.incidents[inc.id] = inc
                 self._load_historical_timeseries()
                 return
@@ -141,6 +151,7 @@ class ITSMDataStore:
                 else:
                     desc = f"Incidente real registrado no ativo {ic} ({prod}) atribuído à equipe {group}. Aberto via {opened_by}."
 
+                title, desc = str(title)[:200], str(desc)[:2000]
                 inc = Incident(
                     id=inc_id,
                     title=title,
@@ -234,13 +245,11 @@ class ITSMDataStore:
         except Exception:
             return 14
 
-    def recalibrate_pool(self, scorer_proba, scorer_shap, threshold_tau: float) -> int:
-        """Replace seed risks with calibrated inference (T015).
+    def recalibrate_pool(self, scorer_proba, scorer_shap, threshold_tau: float,
+                          mttr_scorer=None, category_fn=None) -> int:
+        """Replace seed risks with calibrated inference (T015 + Fase 7).
 
-        Called by the ML engine after honest training. `scorer_proba` maps
-        (title, priority, group, product, config_item, hour) to (p_raw,
-        p_calibrated); `scorer_shap` maps an incident dict to SHAP factors.
-        Returns the number of recalibrated incidents.
+        Preenche também categoria econômica e MTTR estimado por chamado.
         """
         with self._lock:
             n = 0
@@ -257,6 +266,18 @@ class ITSMDataStore:
                     inc.risk_score = risk
                     inc.label_source = "synth_rule"
                     inc.claim_label = "measured"
+                    if mttr_scorer is not None:
+                        try:
+                            inc.estimated_mttr_minutes = float(mttr_scorer(
+                                inc.title, inc.priority, inc.group, inc.product,
+                                inc.config_item, hour))
+                        except Exception:
+                            pass
+                    if category_fn is not None:
+                        try:
+                            inc.risk_category = category_fn(p_cal)
+                        except Exception:
+                            pass
                     if inc.priority == "P1":
                         inc.p1_n1_warning = "Base contém um único exemplar P1 (n=1); sem generalização."
                     inc.shap_factors = scorer_shap({
@@ -287,6 +308,13 @@ class ITSMDataStore:
         inc.risk_score = max(1, min(99, int(round(p_cal * 100.0))))
         inc.label_source = "synth_rule"
         inc.claim_label = "measured"
+        try:
+            inc.estimated_mttr_minutes = float(ml_engine.predict_mttr_minutes(
+                inc.title, inc.priority, inc.group, inc.product,
+                inc.config_item, hour))
+            inc.risk_category = ml_engine.risk_category(p_cal)
+        except Exception:
+            pass
         inc.shap_factors = ml_engine.calculate_incident_shap({
             "title": inc.title, "priority": inc.priority, "group": inc.group,
             "product": inc.product, "config_item": inc.config_item, "hour": hour,
@@ -384,6 +412,10 @@ class ITSMDataStore:
                 threshold_tau=ml_engine.threshold_tau,
                 claim_label="measured",
                 p1_n1_warning="Base contém um único exemplar P1 (n=1); sem generalização." if prio == "P1" else None,
+                risk_category=ml_engine.risk_category(p_cal),
+                estimated_mttr_minutes=ml_engine.predict_mttr_minutes(
+                    title=title, priority=prio, group=group, product=prod,
+                    config_item=ic, hour=now.hour),
             )
             self.incidents[inc.id] = inc
             DatabaseRepository.save_incident(inc.model_dump())

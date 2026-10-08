@@ -1,6 +1,7 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from contextlib import asynccontextmanager
 import uvicorn
 import asyncio
 import json
@@ -14,12 +15,35 @@ from backend.services.ml_engine import ml_engine
 from backend.core.config import settings
 from backend.utils.logger import logger
 
+AUDIT_ROLLUP_INTERVAL_S = float(os.getenv("LOCAPREDICT_AUDIT_INTERVAL_S", "86400"))  # 24h (Fase 6.2)
+
+
+async def _audit_rollup_loop():
+    """Job assíncrono de auditoria contínua: Brier móvel + MdAE a cada 24h."""
+    while True:
+        await asyncio.sleep(AUDIT_ROLLUP_INTERVAL_S)
+        try:
+            out = ml_engine.rollup_audit_job()
+            logger.info(f"Audit rollup: {out}")
+        except Exception as e:
+            logger.warning(f"Audit rollup failed: {e}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(_audit_rollup_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
+
 app = FastAPI(
     title=settings.PROJECT_NAME,
     description="Plataforma avançada de AIOps orientada por Machine Learning para previsão de incidentes, risco de quebra de OLA, clusters NLP e regimes operacionais.",
     version=settings.VERSION,
     docs_url="/docs",
-    redoc_url="/redoc"
+    redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
 # Enable Strict CORS with whitelisted trusted origins
@@ -78,11 +102,14 @@ async def websocket_endpoint(websocket: WebSocket):
             action = payload.get("action")
 
             if action == "SIMULATE_TICKET":
-                new_inc = itsm_store.create_synthetic_incoming()
-                await ws_manager.broadcast({
-                    "event": "NEW_INCIDENT",
-                    "incident": new_inc.model_dump()
-                })
+                if ml_engine.auto_block:
+                    await websocket.send_json({"event": "BLOCKED", "reason": ml_engine.auto_block_reason})
+                else:
+                    new_inc = itsm_store.create_synthetic_incoming()
+                    await ws_manager.broadcast({
+                        "event": "NEW_INCIDENT",
+                        "incident": new_inc.model_dump()
+                    })
             elif action == "PING":
                 await websocket.send_json({"event": "PONG"})
     except WebSocketDisconnect:

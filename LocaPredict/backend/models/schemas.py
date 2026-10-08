@@ -1,4 +1,4 @@
-from typing import List, Optional, Literal, Dict, Any
+from typing import List, Optional, Literal, Dict, Any, Tuple
 from pydantic import BaseModel, Field, field_validator, ConfigDict
 import html
 
@@ -13,6 +13,15 @@ class SHAPFactor(BaseModel):
     explainer: Optional[str] = Field(None, max_length=64)
     explainer_version: Optional[str] = Field(None, max_length=64)
     fidelity_topk: Optional[float] = None
+    # Coalizão causal do Grouped SHAP (Fase 5)
+    group: Optional[str] = Field(None, max_length=64)
+
+
+class GroupedShap(BaseModel):
+    """Φ_G por coalizão causal + membros top (Fase 5/7)."""
+    group: str = Field(..., max_length=64)
+    phi: float
+    members: List[Tuple[str, float]] = []
 
 class IncidentBase(BaseModel):
     id: str = Field(..., max_length=50)
@@ -44,6 +53,9 @@ class IncidentBase(BaseModel):
     threshold_tau: Optional[float] = None
     claim_label: Optional[Literal['measured', 'projection']] = None
     p1_n1_warning: Optional[str] = None
+    # Fase 7: categoria econômica + MTTR estimado por chamado.
+    risk_category: Optional[Literal['CRITICAL', 'WARNING', 'SAFE']] = None
+    estimated_mttr_minutes: Optional[float] = None
 
     @field_validator('title', 'description', 'group', 'product', mode='before')
     @classmethod
@@ -142,6 +154,9 @@ class MLOpsStatus(BaseModel):
     retraining_in_progress: bool = False
     samples_in_training: int
     samples_in_inference: int
+    # Fase 4/6: gate de calibração e PSI global (Gate 5/6).
+    brier_gate: Optional[str] = None
+    psi_overall: Optional[float] = None
 
 class MetricsOverview(BaseModel):
     total_active_incidents: int
@@ -186,3 +201,52 @@ class AuthTokenResponse(BaseModel):
     token_type: str = "Bearer"
     expires_in_minutes: int
     user: Dict[str, Any]
+
+
+# Fase 7 — contratos da reformulação (Fase 7.1)
+class PredictRequest(BaseModel):
+    title: str = Field(..., min_length=3, max_length=500)
+    priority: Literal['P1', 'P2', 'P3', 'P4']
+    group: str = Field(..., max_length=100)
+    product: str = Field(..., max_length=100)
+    config_item: str = Field(default="IC00001", max_length=50)
+    hour: int = Field(default=14, ge=0, le=23)
+
+
+class PredictionResponse(BaseModel):
+    ticket_id: Optional[str] = None
+    calibrated_risk_score: float = Field(..., ge=0.0, le=1.0)
+    risk_score: int = Field(..., ge=0, le=100)
+    risk_category: Literal['CRITICAL', 'WARNING', 'SAFE']
+    threshold_tau_star: float
+    estimated_mttr_minutes: float
+    grouped_shap_explanations: List[GroupedShap] = []
+    shap_factors: List[SHAPFactor] = []
+    claim_label: Literal['measured', 'projection'] = 'measured'
+
+
+class FeedbackResolution(BaseModel):
+    ticket_id: str = Field(..., max_length=50)
+    actual_sla_violado: bool
+    actual_resolution_time: float = Field(..., ge=0.0)
+
+
+class DriftStatusResponse(BaseModel):
+    psi_overall: float
+    psi_panel: List[Dict[str, Any]] = []
+    brier_rolling_7d: Optional[float] = None
+    mdae_mttr_7d: Optional[float] = None
+    auto_block: bool = False
+    auto_block_reason: str = ""
+
+
+class ModelAuditMetrics(BaseModel):
+    model_version: str
+    brier_blind: float
+    brier_gate: str
+    decile_max_err: float
+    mdape_mttr: float
+    cost_reduction_pct: float
+    recall_at_star: float
+    tau_star: float
+    walk_folds: List[Dict[str, Any]] = []

@@ -27,7 +27,11 @@ export const IncidentCard: React.FC<IncidentCardProps> = memo(({
   const canAssign = hasPermission('assign');
   const canEscalate = hasPermission('escalate');
 
-  const isCritical = incident.risk_score >= 80;
+  const isCritical = incident.risk_category
+    ? incident.risk_category === 'CRITICAL'
+    : incident.threshold_tau != null
+      ? (incident.p_calibrated ?? incident.risk_score / 100) >= incident.threshold_tau
+      : incident.risk_score >= 80;
   const isSlaWarning = incident.sla_remaining_minutes > 0 && incident.sla_remaining_minutes <= 45;
   const isSlaBreached = incident.sla_remaining_minutes <= 0;
 
@@ -98,6 +102,34 @@ export const IncidentCard: React.FC<IncidentCardProps> = memo(({
       <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 'var(--space-3)' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-3)', flex: 1 }}>
           <RiskBadge score={incident.risk_score} size="md" />
+          {incident.risk_category && (
+            <span
+              title="Categoria econômica (τ* validado)"
+              style={{
+                fontSize: '10px',
+                fontWeight: 'var(--font-weight-bold)',
+                padding: '2px 8px',
+                borderRadius: 'var(--radius-sm)',
+                backgroundColor: incident.risk_category === 'CRITICAL'
+                  ? 'rgba(220, 38, 38, 0.2)'
+                  : incident.risk_category === 'WARNING'
+                    ? 'rgba(202, 138, 4, 0.2)'
+                    : 'rgba(22, 163, 74, 0.2)',
+                color: incident.risk_category === 'CRITICAL'
+                  ? 'var(--color-risk-critical)'
+                  : incident.risk_category === 'WARNING'
+                    ? 'var(--color-risk-medium)'
+                    : 'var(--color-risk-low)',
+              }}
+            >
+              {incident.risk_category}
+              {incident.estimated_mttr_minutes != null && (
+                <> · MTTR ~{incident.estimated_mttr_minutes >= 60
+                  ? `${(incident.estimated_mttr_minutes / 60).toFixed(1)}h`
+                  : `${Math.round(incident.estimated_mttr_minutes)}min`}</>
+              )}
+            </span>
+          )}
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', flex: 1 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>

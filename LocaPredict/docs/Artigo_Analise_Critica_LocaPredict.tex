@@ -1,0 +1,226 @@
+% !TEX program = pdflatex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[brazil]{babel}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{geometry}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\geometry{margin=2.4cm}
+
+\hypersetup{colorlinks=true,linkcolor=blue!60!black,citecolor=blue!60!black,urlcolor=blue!60!black}
+\lstset{basicstyle=\ttfamily\footnotesize,breaklines=true,frame=single,backgroundcolor=\color{gray!6}}
+
+\newtheorem{definicao}{Definição}[section]
+\newtheorem{teorema}{Teorema}[section]
+\newtheorem{proposicao}{Proposição}[section]
+
+\title{LocaPredict SLA Guard v3 (FusionOps):\\ análise crítica, base teórica e matemática\\ de uma plataforma AIOps validada no tempo}
+\author{Avaliação técnica independente \emph{white-box} \\ (código-fonte + dataset + testes + especificações)}
+\date{4 de setembro de 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Este artigo analisa de forma \emph{white-box} a plataforma AIOps
+\textbf{LocaPredict SLA Guard v3} e explicita o arcabouço teórico, conceitual
+e matemático que sustenta seu funcionamento: validação temporal walk-forward
+sem embaralhamento, com purga de sobreposição; engenharia causal de variáveis
+estritamente passadas; sanitização textual canônica com TF-IDF e LSA;
+codificação bayesiana de categóricas; filtro de multicolinearidade por VIF;
+duas cabeças de Gradient Boosting --- Focal Loss para violação de SLA e
+mediana quantílica para tempo de resolução; calibração isotônica em bloco
+temporal com limiar econômico $\tau^*$; Grouped TreeSHAP por coalizões
+causais; e monitoramento por PSI com auditoria contínua e bloqueio automático.
+Sobre $122\,543$ chamados reais, a dobra cega de dezembro reporta ROC-AUC
+$0{,}9753$, Brier $0{,}0067$ com erro decil $1{,}45\%$, redução de custo de
+$42{,}3\%$ frente ao corte estático e MdAPE de $0{,}99$ no MTTR --- este último
+e o piso de recall, ambos BLOCKED e divulgados, delimitando com precisão o que
+está provado e o que permanece em aberto.
+\end{abstract}
+
+\noindent\textbf{Palavras-chave:} AIOps, ITSM, validação temporal, Focal Loss,
+regressão quantílica, calibração, SHAP, PSI, auditoria de ML.
+
+\tableofcontents
+\newpage
+
+% ============================================================
+\section{Objeto e método}
+% ============================================================
+
+O LocaPredict SLA Guard v3 (grupo GKL, turma 2TSCOA, Challenge Locaweb 2026) é
+uma plataforma AIOps em FastAPI + React 18 + LightGBM para predição de risco
+de quebra de OLA/SLA, estimativa de tempo de resolução, forecast de demanda
+D+1/D+7, clusterização de ruído, explicabilidade e observabilidade MLOps,
+sobre \textbf{122\,543 chamados reais} verificados em
+\texttt{locaweb\_clean.parquet} ($122\,543 \times 36$, janeiro/2023 a
+dezembro/2025). Método: leitura integral do código, dos testes (47),
+das especificações e da Constituição v1.1.0, com reprodução independente de
+cada número aqui citado.
+
+\subsection{Base empírica}
+Prioridade: P4 $53{,}2\%$, P3 $34{,}1\%$, P2 $12{,}8\%$, \textbf{P1 $n=1$}.
+Rótulo de violação por regra de duração: $5{,}16\%$; violação KPI observada:
+$0{,}20\%$ (o rótulo sintético é sempre nomeado como tal).
+\texttt{is\_fp} (encerramento sem intervenção ou $\le 30$s): $65{,}6\%$.
+Durações: mediana $16{,}3$ min, média $4\,142$ min (assimetria $\times 254$),
+com outliers de data-quality (máximo $\approx 8{,}8\times10^7$s). Team14
+concentra $75{,}7\%$ dos chamados; Hosting Linux, $79{,}0\%$.
+
+\subsection{Framework}
+Guias de validação analítica (ICH Q2, M10, USP, CLSI) não governam software;
+o arcabouço aplicável é o de validação de modelos de ML: janelas temporais
+pré-registradas, estimativas fora-da-amostra, calibração com incerteza e
+trilhas de auditoria. Duas regras regem tudo: critérios congelados antes do
+teste e nenhum número de treino reportado como generalização.
+
+% ============================================================
+\section{Validação temporal walk-forward}
+% ============================================================
+
+\subsection{O erro I.I.D. e sua eliminação}
+Incidentes não são independentes nem identicamente distribuídos: chegam em
+surtos, regimes mudam, squads aprendem. Particionamento aleatório vaza o
+futuro para o treino. O protocolo adotado ordena $t_1\le t_2\le\dots\le t_N$
+pela abertura e expande a janela: para cada mês de teste $m^*$ entre os três
+últimos, treino $=$ meses anteriores ao mês de calibração, calibração $=$ mês
+anterior ao teste, teste $=$ um mês cego, com aquecimento mínimo de três meses
+e descarte registrado de dobras degeneradas. Nenhum shuffle em nenhum ponto.
+
+\subsection{Purga de sobreposição}
+Rótulos de violação realizam-se no encerramento; linhas de treino cujo
+$t_{\text{end}}$ invade o período seguinte são excluídas (López de Prado),
+com contagem divulgada por dobra. As features, por construção, usam apenas
+informação com $t\le t_{\text{abertura}}$: volume trailing de 24h, velocidades
+de chegada em 15/60/240 min por produto e carga relativa do grupo contra
+baseline grupo $\times$ dia-da-semana --- janelas de passado, nunca estado
+``ainda não resolvido'', que exigiria conhecer o futuro.
+
+% ============================================================
+\section{Representação: texto e categóricas}
+% ============================================================
+
+\subsection{Sanitização canônica}
+Antes de vetorizar, tokens de alta cardinalidade colapsam por regex
+determinística e idempotente: IPv4/IPv6 $\to$ \_\_IP\_\_, hexadecimais e
+códigos $\to$ \_\_ERR\_CODE\_\_, URLs $\to$ \_\_URL\_\_, hostnames $\to$
+\_\_SERVER\_NAME\_\_, UUIDs $\to$ \_\_UUID\_\_. Preserva-se o fato semântico
+(``havia um IP'') e elimina-se o identificador que fragmenta estatísticas.
+
+\subsection{TF-IDF com n-gramas e LSA}
+$\mathrm{tfidf}(t,d,D)=\mathrm{tf}(t,d)\cdot(\log\frac{1+N}{1+\mathrm{df}(t)}+1)$
+com uni/bi/trigramas, $\mathrm{min\_df}=5$, $\mathrm{max\_df}=0{,}8$,
+reduzidos por SVD truncada a $k=50$ componentes densos. Fit exclusivo no
+treino da dobra. Embeddings densos multilíngues existem atrás de flag,
+desligados por padrão: exigiriam $\sim$GBs de RAM/imagem e violariam a regra
+de portabilidade do deploy gratuito --- decisão registrada, não omissão.
+
+\subsection{Codificação bayesiana e VIF}
+Categóricas de alta cardinalidade (prioridade, squad, produto, ativo) usam
+\begin{equation}
+\hat{x}_{\text{cat}}=\frac{n\bar{y}_{\text{cat}}+m\bar{y}_{\text{global}}}{n+m},
+\qquad m=10,
+\end{equation}
+ajustada só no treino: categorias raras retraem à média global, sem
+overfitting e sem LabelEncoder ordinal espúrio. Multicolinearidade por
+Spearman ($|r|>0{,}85$) e VIF manual $\mathrm{VIF}_j=1/(1-R_j^2)>5$:
+\texttt{arrive\_15m} e \texttt{arrive\_60m} caíram (redundantes com a de
+240 min); 7 numéricas sobreviveram.
+
+% ============================================================
+\section{As duas cabeças preditivas}
+% ============================================================
+
+\subsection{Violação de SLA: Focal Loss}
+Sob prevalência $<10\%$, entropia cruzada afoga-se em exemplos triviais. A
+cabeça classificadora minimiza
+\begin{equation}
+\mathcal{L}_{\text{Focal}}=-\alpha_t(1-p_t)^\gamma\ln(p_t),\qquad
+\gamma=2{,}0,\ \ \alpha=\text{taxa de negativos},
+\end{equation}
+com gradiente e hessiana derivados em forma fechada e verificados por
+diferenças finitas em teste automatizado. Early stopping na calibração,
+sementes e threads fixas: determinismo bit a bit.
+
+\subsection{MTTR: mediana quantílica com diagnóstico Tweedie}
+Para perda quadrática direta sobre minutos brutos, a Tweedie
+($\mathrm{Var}(Y)=\mu^p$, $p=1{,}5$) modela a média sob cauda longa --- mas o
+aceite é \emph{mediano} (MdAPE), e média é o estimador errado para ele sob
+assimetria $\times 254$. A cabeça primária é, portanto, regressão quantílica
+$\alpha=0{,}5$ (mediana condicional, equivariante a transformações monótonas);
+a média Tweedie segue como diagnóstico para planejamento de capacidade, e a
+via logarítmica com correção $\hat{y}=\exp(\hat{z}+\hat{\sigma}^2/2)-1$
+permanece como fallback. Decisão documentada, não improviso.
+
+% ============================================================
+\section{Calibração e decisão econômica}
+% ============================================================
+
+Escores brutos não são probabilidades. Uma isotônica monótona
+$g$ ajustada \emph{no bloco de calibração} (independente de treino e teste)
+minimiza $\sum(y_i-g(\hat{s}_i))^2$ e produz $\hat p$. O limiar é econômico:
+\begin{equation}
+\tau^*=\arg\min_\tau\,C_{FP}\cdot FP(\tau)+C_{FN}\cdot FN(\tau),\qquad
+C_{FP}=30,\ C_{FN}=600,
+\end{equation}
+com o piso de recall como gate divulgado. Categorias: CRITICAL se
+$p\ge\tau^*$, WARNING em $[\tau^*/4,\tau^*)$, SAFE abaixo. Risco exibido:
+$\mathrm{round}(100\hat p)$.
+
+% ============================================================
+\section{Grouped TreeSHAP e monitoramento}
+% ============================================================
+
+Valores de Shapley $\phi_i$ somam exatamente à margem:
+$f(x)=\phi_0+\sum_i\phi_i$ (testado a $10^{-4}$ em 100\% das predições).
+Variáveis do mesmo fenômeno formam coalizões fechadas ---
+sobrecarga de turno, capacidade técnica, severidade semântica --- e a API
+retorna $\Phi_G=\sum_{j\in G}\phi_j$ por macro-causa mais o detalhamento,
+eliminando disputas espúrias entre correlatas. Deriva por PSI em decis,
+$\mathrm{PSI}=\sum(P_b-Q_b)\ln(P_b/Q_b)$, com KS e Holm em paralelo; a tabela
+\texttt{prediction\_audit} confronta previsão e desfecho, um job de 24h
+computa Brier móvel e MdAE, e degradação $>20\%$ bloqueia a inferência
+automática (503 auditado).
+
+% ============================================================
+\section{Resultados e limites}
+% ============================================================
+
+Na dobra cega de dezembro ($n=27\,321$, $0{,}78\%$ positivos): ROC-AUC
+$0{,}9753$, PR-AUC $0{,}2588$, Brier $0{,}0067$ com erro decil $1{,}45\%$
+(gate PASS), custo $\tau^*=0{,}04$ de R\$ $410{.}370$ contra R\$
+$710{.}970$ do corte $0{,}5$ ($-42{,}3\%$, gate PASS). Forecast: WAPE de
+backtest $13{,}44\%$ vs.\ $14{,}14\%$ do baseline (Diebold--Mariano
+$p=0{,}0029$). HDBSCAN executado de verdade recusou certificar a taxonomia
+(overlap mediano $0{,}038$), rotulada baseline com contagens medidas.
+
+Dois gates permanecem BLOCKED e divulgados: recall $@\tau^*=0{,}66$ contra o
+piso $0{,}80$ (conflito econômico real sob custos 20:1 e prevalência
+$0{,}78\%$) e MdAPE $0{,}99$ contra $<0{,}18$ (teto dos dados: o baseline
+trivial de medianas por prioridade atinge $0{,}998$). Ganhos de $-38{,}5\%$ e
+$-21{,}4\%$ seguem projeções até piloto controlado. Sólido, aqui demonstrado,
+não significa sem limites: significa incapaz de ocultá-los.
+
+\begin{thebibliography}{9}
+\bibitem{breiman2001} Breiman, L. Random Forests. \emph{Machine Learning}, 45:5--32, 2001.
+\bibitem{salton1988} Salton, G., Buckley, C. Term-weighting in automatic retrieval. \emph{IP\&M}, 24(5), 1988.
+\bibitem{lin2017} Lin, T.-Y.\ \emph{et al.} Focal Loss for dense object detection. \emph{ICCV}, 2017.
+\bibitem{lundberg2017} Lundberg, S., Lee, S.-I. A unified approach to interpreting model predictions. \emph{NeurIPS}, 2017.
+\bibitem{shapley1953} Shapley, L. A value for $n$-person games. \emph{Ann. Math. Studies}, 1953.
+\bibitem{mcinnes2017} McInnes, L.\ \emph{et al.} HDBSCAN. \emph{JOSS}, 2017.
+\bibitem{massey1951} Massey, F. The KS test for goodness of fit. \emph{JASA}, 1951.
+\bibitem{holm1979} Holm, S. A sequentially rejective multiple test procedure. \emph{Scand.\ J.\ Statist.}, 1979.
+\bibitem{diebold1995} Diebold, F., Mariano, R. Comparing predictive accuracy. \emph{JBES}, 1995.
+\bibitem{lopez2018} López de Prado, M. \emph{Advances in Financial Machine Learning}. Wiley, 2018.
+\end{thebibliography}
+
+\end{document}
